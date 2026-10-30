@@ -21,7 +21,7 @@
 set -euo pipefail
 umask 022
 
-VF_VERSION="1.1.2"
+VF_VERSION="1.2.0"
 
 # ------------------------------------------------------------------------------------------------
 # Paths: the official ViciBox layout wherever one exists
@@ -89,8 +89,13 @@ FIREWALLD_WAS_ACTIVE=0 FIREWALLD_WAS_ENABLED=0 ORIG_FW_ACTIVE="" ORIG_FW_ENABLED
 BACKUP_DIR="" ORIGINAL_BACKUP_DIR=""
 VBF_ARGS="" CRON_SCHED=""
 SELINUX=0 RPM_PORTAL=0 PORTAL_INSTALLED=0 SSL_SELF_SIGNED=0 LISTEN_ADDED=0 LISTEN_HTTP_ADDED=0 PASS_HASH=0
-FW_PRIORITY_OK=0 FAIL2BAN_INSTALLED=0
+FW_PRIORITY_OK=0 FAIL2BAN_INSTALLED=0 FW_VERSION=unknown
+# The validated-agents zone. Without zone priorities (firewalld < 2.0) an address that matches several
+# source zones gets the alphabetically FIRST one, so this name must sort after "external" (the whitelist,
+# which also has SSH) and after "internal"; "drop" and "trusted"-ordering stay as intended.
+AGENT_ZONE=vicidial-agents
 CARRIER_IPS=()
+SKIPPED_LAN=()
 ALLOW_NOW=()
 
 # ------------------------------------------------------------------------------------------------
@@ -164,15 +169,17 @@ render_template() { # FILE  (uses @@TOKENS@@ from TPL_* variables; literal repla
 	printf '%s\n' "$t"
 }
 state_get() { [ -r "$STATE_FILE" ] || return 0; ( set +u; . "$STATE_FILE" 2>/dev/null; printf '%s' "${!1:-}" ); }
-fw_version_ge() { # VERSION MIN -> true when major.minor of VERSION >= MIN (e.g. 1.3.4 >= 0.9)
+fw_version_ge() { # VERSION MIN -> true when major.minor of VERSION >= MIN (e.g. 2.1.0 >= 2.0)
 	local v=${1:-} m=$2 vmaj vmin mmaj mmin
 	vmaj=${v%%.*}; vmin=${v#*.}; vmin=${vmin%%.*}; mmaj=${m%%.*}; mmin=${m#*.}; mmin=${mmin%%.*}
 	[[ $vmaj =~ ^[0-9]+$ && $vmin =~ ^[0-9]+$ ]] || return 1
 	(( 10#$vmaj > 10#$mmaj || (10#$vmaj == 10#$mmaj && 10#$vmin >= 10#$mmin) ))
 }
-detect_fw_priority() { # zone priorities need firewalld 0.9 (2020); older versions would refuse the attribute
-	local v; v=$(firewall-cmd --version 2>/dev/null | head -1 | tr -d '[:space:]' || true)
-	if fw_version_ge "$v" 0.9; then FW_PRIORITY_OK=1; else FW_PRIORITY_OK=0; fi
+detect_fw_priority() { # zone priorities exist from firewalld 2.0 on; older versions would refuse the attribute
+	# firewall-cmd --version needs the daemon; firewall-offline-cmd answers while it is stopped
+	local v; v=$( { firewall-cmd --version 2>/dev/null || firewall-offline-cmd --version 2>/dev/null; } | grep -E "^[0-9]+.[0-9]+" | head -1 | tr -d "[:space:]" || true)
+	FW_VERSION=${v:-unknown}
+	if fw_version_ge "$v" 2.0; then FW_PRIORITY_OK=1; else FW_PRIORITY_OK=0; fi
 }
 join_by() { local sep=$1 out="" x; shift; for x in "$@"; do out+="${out:+$sep}$x"; done; printf '%s' "$out"; }
 
@@ -538,7 +545,31 @@ compute_plan() {
 	if [ -n "$SSH_IP" ] && ((SSH_WHITELIST)) && ! ssh_covered_by_trusted; then ALLOW_NOW+=("$SSH_IP"); fi
 	ALLOW_NOW+=(${WHITELIST[@]+"${WHITELIST[@]}"} ${CARRIER_IPS[@]+"${CARRIER_IPS[@]}"})
 	if ((${#ALLOW_NOW[@]})); then mapfile -t ALLOW_NOW < <(printf '%s\n' "${ALLOW_NOW[@]}" | awk '!s[$0]++'); fi
+	# an address that already has a trusted or internal source must not ALSO be whitelisted: without zone
+	# priorities "external" sorts first and would take away the wider access it has today
+	local keep=() a
+	SKIPPED_LAN=()
+	for a in ${ALLOW_NOW[@]+"${ALLOW_NOW[@]}"}; do
+		if lan_zone_covers "$a"; then SKIPPED_LAN+=("$a"); else keep+=("$a"); fi
+	done
+	ALLOW_NOW=(${keep[@]+"${keep[@]}"})
 	return 0
+}
+lan_zone_sources() { # source addresses of the trusted and internal zones: from options and from the existing trusted zone file
+	printf '%s\n' ${TRUSTED_NETS[@]+"${TRUSTED_NETS[@]}"} ${INTERNAL_NETS[@]+"${INTERNAL_NETS[@]}"}
+	sed -n 's/.*<source address="\([0-9./]*\)".*/\1/p' "$FW_ETC/zones/trusted.xml" 2>/dev/null || true
+}
+lan_zone_covers() { # IP-or-CIDR -> true when a trusted/internal source already contains it
+	local ip=${1%/*} s
+	valid_ipv4 "$ip" || return 1
+	while read -r s; do
+		[ -n "$s" ] || continue
+		case $s in
+			*/*) if valid_cidr "$s" && cidr_contains "$s" "$ip"; then return 0; fi ;;
+			*)   if [ "$s" = "$ip" ]; then return 0; fi ;;
+		esac
+	done < <(lan_zone_sources)
+	return 1
 }
 
 public_services() {
@@ -558,7 +589,7 @@ show_plan() {
 	if [ "$MODE" != blacklist ]; then
 		info "external zone ....... http https asterisk rtp ssh  for the ViciWhite list (carriers, offices, admins)"
 		if [ "$MODE" = dynamic ]; then
-			info "agents zone ......... http https asterisk rtp$( ((AGENT_SSH)) && echo " ssh")  for addresses validated through the portal or logged in within $DYNAMIC_AGE days"
+			info "agent zone .......... http https asterisk rtp$( ((AGENT_SSH)) && echo " ssh")  for addresses validated through the portal or logged in within $DYNAMIC_AGE days"
 		fi
 		((PUBLIC_RTP)) || warn "RTP is NOT public: every carrier media address must be in ViciWhite or calls will have no audio"
 	fi
@@ -568,6 +599,7 @@ show_plan() {
 	((${#TRUSTED_IFACES[@]})) && info "trusted interfaces .. ${TRUSTED_IFACES[*]}"
 	((${#TRUSTED_NETS[@]})) && info "trusted networks .... ${TRUSTED_NETS[*]}"
 	((${#INTERNAL_NETS[@]})) && info "internal networks ... ${INTERNAL_NETS[*]}  (+ mysql, ftp, AMI 5038)"
+	if ((${#SKIPPED_LAN[@]})); then info "not whitelisted ...... $(join_by ', ' "${SKIPPED_LAN[@]}") (already in the trusted/internal zone, which keeps its wider access)"; fi
 	if ((${#ALLOW_NOW[@]})); then info "ViciWhite entries ... $(join_by ', ' "${ALLOW_NOW[@]}")"; else info "ViciWhite entries ... none added"; fi
 	if ((PORTAL)); then
 		info "Dynamic Portal ...... https://$PORTAL_FQDN:$PORTAL_PORT/valid8.php$( ((PORTAL_HTTP)) && echo "  and http://$PORTAL_FQDN:$PORTAL_HTTP_PORT/valid8.php")"
@@ -599,7 +631,17 @@ confirm_plan() {
 take_backup() {
 	hdr "Backing up the current configuration"
 	BACKUP_DIR="$BACKUP_ROOT/$(date +%Y%m%d-%H%M%S)"
-	[ -n "$ORIGINAL_BACKUP_DIR" ] || ORIGINAL_BACKUP_DIR=$BACKUP_DIR
+	if [ -z "$ORIGINAL_BACKUP_DIR" ]; then
+		# a run after an aborted one: the oldest backup still holds the pre-installation firewall
+		local first; first=$(ls -1d "$BACKUP_ROOT"/*/ 2>/dev/null | head -1 || true); first=${first%/}
+		if [ -n "$first" ] && [ -f "$first/pre-install.env" ]; then
+			ORIGINAL_BACKUP_DIR=$first
+			ORIG_FW_ACTIVE=$(sed -n "s/^FIREWALLD_WAS_ACTIVE=//p" "$first/pre-install.env"); ORIG_FW_ENABLED=$(sed -n "s/^FIREWALLD_WAS_ENABLED=//p" "$first/pre-install.env")
+			info "an earlier (aborted) run left a backup; $first stays the original for rollback and uninstall"
+		else
+			ORIGINAL_BACKUP_DIR=$BACKUP_DIR
+		fi
+	fi
 	[ -n "$ORIG_FW_ACTIVE" ] || ORIG_FW_ACTIVE=$FIREWALLD_WAS_ACTIVE
 	[ -n "$ORIG_FW_ENABLED" ] || ORIG_FW_ENABLED=$FIREWALLD_WAS_ENABLED
 	((DRY_RUN)) && { info "(dry-run) would back up to $BACKUP_DIR"; return 0; }
@@ -705,7 +747,7 @@ install_firewalld_config() {
 	if ! service_defined_elsewhere rtp; then
 		emit_service rtp "RTP (ViciDial)" "Asterisk RTP media range from /etc/asterisk/rtp.conf" "$RTP_RANGE/udp"
 	else
-		info "keeping the existing rtp service definition: $(firewall-cmd --info-service=rtp 2>/dev/null | sed -n 's/^[[:space:]]*ports: //p' || true)"
+		info "keeping the existing rtp service definition: $(grep -ho 'port="[^"]*"' "$FW_LIB/services/rtp.xml" "$FW_ETC/services/rtp.xml" 2>/dev/null | head -1 || true)"
 	fi
 	ok "services: dynportal-ssl($PORTAL_PORT) dynportal($PORTAL_HTTP_PORT) asterisk rtp($RTP_RANGE)"
 
@@ -724,13 +766,15 @@ install_firewalld_config() {
 	ext_ips=(whiteips whitenets)
 	agt_ips=(dynamiclist)
 	drop_ips=(blackips blacknets voipblip voipblnet geoblock)
-	# priorities (firewalld 0.9+): drop first, then cluster peers, then the whitelist, then validated agents
+	# order: drop first, then cluster peers, then the whitelist, then validated agents (priorities on firewalld 2.0+,
+	# alphabetical zone names before that: drop < external < internal < trusted < vicidial-agents)
+	run rm -f "$FW_ETC/zones/agents.xml"   # the 1.1.x name, which sorted before "external"
 	emit_zone public "Public" "Internet-facing. Only RTP audio and the Dynamic Portal answer here; everything else needs a ViciWhite entry, a portal validation, or a trusted/internal source (vicidial-firewall)." "" pub_svc none none none
 	emit_zone external "External" "Trusted addresses: the ViciWhite IP list (carriers, offices, VPNs, administrators). Full ViciDial access including SSH (vicidial-firewall)." "" ext_svc ext_ips none none -10
-	emit_zone agents "Agents" "Addresses validated through the Dynamic Portal or by a ViciDial login within the dynamic age: web, SIP/WebRTC and audio only (vicidial-firewall)." "" agt_svc agt_ips none none 0
+	emit_zone "$AGENT_ZONE" "ViciDial agents" "Addresses validated through the Dynamic Portal or by a ViciDial login within the dynamic age: web, SIP/WebRTC and audio only (vicidial-firewall)." "" agt_svc agt_ips none none 0
 	emit_zone internal "Internal" "Cluster peers and private networks named with --internal-net: ViciDial services plus MySQL, FTP and the Asterisk manager port (vicidial-firewall)." "" int_svc none INTERNAL_NETS int_ports -15
 	emit_zone drop "Drop" "Blocked addresses: ViciBlack, voipbl.org and geo blocking (vicidial-firewall)." "DROP" none drop_ips none none -20
-	ok "zones: public external agents internal drop$( ((FW_PRIORITY_OK)) || echo " (firewalld < 0.9: no zone priorities)")"
+	ok "zones: public external $AGENT_ZONE internal drop (firewalld $FW_VERSION: $( ((FW_PRIORITY_OK)) && echo "zone priorities" || echo "alphabetical zone order"))"
 }
 
 # ------------------------------------------------------------------------------------------------

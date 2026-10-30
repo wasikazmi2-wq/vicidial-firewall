@@ -55,10 +55,10 @@ chk "(dry-run) SQL: INSERT INTO vicidial_ip_list_entries (ip_address, ip_list_id
 chk "(dry-run) crontab lines: '@reboot $T/usr/bin/VB-firewall --white --dynamic --quiet'"
 chk "(dry-run) write $T/etc/firewalld/zones/external.xml"
 chk "(dry-run) write $T/srv/www/vhosts/dynportal/inc/defaults.inc.php"
-chk "agents zone ......... http https asterisk rtp  for addresses validated through the portal"
+chk "agent zone .......... http https asterisk rtp  for addresses validated through the portal"
 chk "(dry-run) write $T/etc/fail2ban/jail.d/vicidial-dynportal.conf"
 chk "(dry-run) append 'Listen 446' to $T/etc/apache2/ports.conf"
-chk "vicidial-firewall 1.1.2 installed  -  mode: dynamic"
+chk "vicidial-firewall 1.2.0 installed  -  mode: dynamic"
 if grep -qE 'unbound variable|command not found|syntax error' <<<"$out"; then echo "SMOKE A: shell error in output"; fail=1; fi
 [ $fail -eq 0 ] || printf '%s\n' "$out" | tail -60
 
@@ -112,14 +112,15 @@ grep -q '^### ViciBox integrated firewall' "$SMOKE_CRON_OUT" || { echo "SMOKE B:
 ( set -u; . "$STATE_FILE" && [ "$MODE" = dynamic ] && [ "$PORTAL_FQDN" = dialer.example.com ] ) || { echo "SMOKE B: state file broken"; fail=1; }
 
 # v1.1: split zones, priorities, fail2ban files
-[ -s "$FW_ETC/zones/agents.xml" ] || { echo "SMOKE B: agents zone missing"; fail=1; }
-chkf "$FW_ETC/zones/agents.xml"   '<source ipset="dynamiclist"/>'
-chkf "$FW_ETC/zones/agents.xml"   '<service name="dynportal-ssl"/>'
-grep -q '<service name="ssh"/>' "$FW_ETC/zones/agents.xml" && { echo "SMOKE B: agents zone must not include ssh by default"; fail=1; }
+[ -s "$FW_ETC/zones/vicidial-agents.xml" ] || { echo "SMOKE B: agents zone missing"; fail=1; }
+chkf "$FW_ETC/zones/vicidial-agents.xml"   '<source ipset="dynamiclist"/>'
+chkf "$FW_ETC/zones/vicidial-agents.xml"   '<service name="dynportal-ssl"/>'
+grep -q '<service name="ssh"/>' "$FW_ETC/zones/vicidial-agents.xml" && { echo "SMOKE B: agents zone must not include ssh by default"; fail=1; }
 grep -q dynamiclist "$FW_ETC/zones/external.xml" && { echo "SMOKE B: external zone must not include dynamiclist"; fail=1; }
 chkf "$FW_ETC/zones/external.xml" '<source ipset="whiteips"/>'
-chkf "$FW_ETC/zones/external.xml" '<zone priority="-10">'
-chkf "$FW_ETC/zones/drop.xml"     '<zone target="DROP" priority="-20">'
+chkf "$FW_ETC/zones/drop.xml"     '<zone target="DROP">'
+grep -q priority "$FW_ETC/zones/external.xml" && { echo "SMOKE B: firewalld 1.3.4 stub must not get zone priorities"; fail=1; }
+[ -e "$FW_ETC/zones/agents.xml" ] && { echo "SMOKE B: old agents.xml must be removed"; fail=1; }
 chkf "$F2B_ETC/jail.d/vicidial-dynportal.conf" '^port      = 446,81$'
 chkf "$F2B_ETC/jail.d/vicidial-dynportal.conf" '^banaction = firewallcmd-rich-rules$'
 chkf "$F2B_ETC/jail.d/vicidial-dynportal.conf" '^backend = systemd$'

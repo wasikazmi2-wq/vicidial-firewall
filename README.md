@@ -11,7 +11,7 @@ with ViciBox, unmodified and verified against the upstream package checksums:
 |---|---|---|
 | **VB-firewall.pl** | The ViciBox firewall script. Every minute it reads the `ViciWhite` IP list from the ViciDial database plus the addresses of recent agent logins, and syncs them into firewalld IP sets. | openSUSE Build Service `home:vicidial:vicibox/vicibox-firewall` |
 | **Dynamic Portal** | `valid8.php`: a small page on port 446 where an agent enters their ViciDial user ID and password. A good login writes a `VICIBOX` event with the agent's IP into `vicidial_user_log`; VB-firewall opens the firewall for that IP within a minute, on every server of the cluster. | `home:vicidial:vicibox/vicibox-dynportal` |
-| **firewalld layout** | The ViciBox zones: `public` (RTP + portal only), `external` (the ViciWhite list), `agents` (addresses validated through the portal: web, SIP/WebRTC, audio, no SSH), `internal` (cluster peers), `drop` (block lists), fed by the IP sets `whiteips`, `whitenets`, `dynamiclist`, ... | same packages |
+| **firewalld layout** | The ViciBox zones: `public` (RTP + portal only), `external` (the ViciWhite list), `vicidial-agents` (addresses validated through the portal: web, SIP/WebRTC, audio, no SSH), `internal` (cluster peers), `drop` (block lists), fed by the IP sets `whiteips`, `whitenets`, `dynamiclist`, ... | same packages |
 
 Provenance and checksums of every official file: [official/SOURCES.md](official/SOURCES.md).
 Official documentation of the mechanism: [ViciBox docs, Firewall](https://docs.vicibox.com/en/latest/networking/firewall.html)
@@ -27,7 +27,7 @@ Official documentation of the mechanism: [ViciBox docs, Firewall](https://docs.v
                                                       VICIBOX login event with the agent's IP
   3. waits up to 60 s, is redirected to              cron (every minute): VB-firewall --white --dynamic
     https://dialer.example.com/agc/vicidial.php        -> IP goes into the "dynamiclist" IP set
- 4. works normally: web, SIP/WebRTC, audio            agents zone: http https asterisk rtp (no SSH)
+ 4. works normally: web, SIP/WebRTC, audio            vicidial-agents zone: http https asterisk rtp (no SSH)
                                                       IP stays allowed 15 days after the last login
  carriers / office / VPN / admins ────────────────►  ViciWhite IP list (Admin > IP Lists) -> whiteips/whitenets
                                                       external zone: http https asterisk rtp ssh
@@ -188,7 +188,7 @@ original backup for `uninstall`, and keeps the portal's random form field names.
 | `/usr/share/vicibox-firewall/VB-firewall.pl`, `/usr/bin/VB-firewall` | official script + symlink (ViciBox RPM layout); an older copy from the vicibox-firewall package (ViciBox 10, 11) is replaced by the current release, the old one kept in the backup |
 | `/etc/firewalld/ipsets/*.xml` | the 8 official IP set definitions |
 | `/etc/firewalld/services/` | `dynportal`, `dynportal-ssl`, `asterisk` (SIP 5060/5061, IAX 4569, 8088/8089), `rtp` (your RTP range), only where the distribution lacks them |
-| `/etc/firewalld/zones/{public,external,agents,internal,drop}.xml` | the ViciBox zone layout with distribution-neutral service names, plus a separate `agents` zone for validated addresses; zone priorities on firewalld 0.9+ |
+| `/etc/firewalld/zones/{public,external,vicidial-agents,internal,drop}.xml` | the ViciBox zone layout with distribution-neutral service names, plus a separate `vicidial-agents` zone for validated addresses; zone priorities on firewalld 2.0+, alphabetical zone order (which the names are chosen for) before that |
 | `/etc/fail2ban/{jail.d,filter.d}/vicidial-dynportal.conf` | fail2ban jail for the portal (5 failures in 10 min, 1 h ban via firewalld rich rules) |
 | root crontab | `@reboot` and `* * * * * /usr/bin/VB-firewall --white --dynamic --quiet` (the same lines the ViciBox manager writes) |
 | ViciDial DB | `system_settings.allow_ip_lists=1`, `modify_ip_lists=1` for level-9 users, lists `ViciWhite`/`ViciBlack`, initial `ViciWhite` entries |
@@ -218,7 +218,7 @@ Everything that is official is used as-is. What this project adds or changes, an
   `FILTER_SANITIZE_STRING`, fixes a broken `UPDATE` statement, and URL-encodes/escapes the values
   placed in the post-login redirect.
 - **Validated agents are not whitelisted hosts.** ViciBox puts the dynamic list into the same zone as
-  the whitelist, so every validated agent also gets SSH. Here the dynamic list feeds its own `agents`
+  the whitelist, so every validated agent also gets SSH. Here the dynamic list feeds its own `vicidial-agents`
   zone with web, SIP/WebRTC and audio only; `--agent-ssh` restores the stock behaviour.
 - **Brute-force protection on the portal**: failed attempts raise ViciDial's own `failed_login_count`
   (stock default off), every attempt is written to syslog, and a fail2ban jail bans the address.

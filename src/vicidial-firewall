@@ -94,7 +94,7 @@ cmd_status() {
 		say ""; say "${c_bld}Active zones${c_off}"; "$FWC" --get-active-zones 2>/dev/null | sed 's/^/  /'
 		say ""; say "${c_bld}Public zone allows${c_off}: $("$FWC" --zone=public --list-services 2>/dev/null) $("$FWC" --zone=public --list-ports 2>/dev/null)"
 		say "${c_bld}External zone (ViciWhite) allows${c_off}: $("$FWC" --zone=external --list-services 2>/dev/null)"
-		say "${c_bld}Agents zone (validated) allows${c_off}: $("$FWC" --zone=agents --list-services 2>/dev/null)"
+		say "${c_bld}Agents zone (validated) allows${c_off}: $("$FWC" --zone=vicidial-agents --list-services 2>/dev/null)"
 		say ""; say "${c_bld}IP sets${c_off}"
 		local s
 		for s in whiteips whitenets dynamiclist blackips blacknets voipblip voipblnet geoblock; do printf '  %-12s %s\n' "$s" "$(ipset_count "$s")"; done

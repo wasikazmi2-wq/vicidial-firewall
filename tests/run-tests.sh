@@ -80,10 +80,12 @@ MODE=dynamic; PORTAL=1; PORTAL_HTTP=0; KEEP_SSH_PUBLIC=0; PUBLIC_RTP=0
 mapfile -t svc < <(public_services); t "public services no rtp" eq "${svc[*]}" "dhcpv6-client dynportal-ssl"
 MODE=blacklist; mapfile -t svc < <(public_services); t "blacklist keeps rtp public" eq "${svc[*]}" "rtp dhcpv6-client ssh http https asterisk dynportal-ssl"
 MODE=dynamic; PUBLIC_RTP=1
-t  "fw_version_ge 1.3.4 >= 0.9" fw_version_ge 1.3.4 0.9
-t  "fw_version_ge 0.9.3 >= 0.9" fw_version_ge 0.9.3 0.9
-tn "fw_version_ge 0.8.2 >= 0.9" fw_version_ge 0.8.2 0.9
-tn "fw_version_ge garbage"      fw_version_ge "" 0.9
+t  "fw_version_ge 2.1.0 >= 2.0" fw_version_ge 2.1.0 2.0
+t  "fw_version_ge 2.0.3 >= 2.0" fw_version_ge 2.0.3 2.0
+tn "fw_version_ge 0.9.3 >= 2.0 (ViciBox 10)" fw_version_ge 0.9.3 2.0
+tn "fw_version_ge 1.3.4 >= 2.0" fw_version_ge 1.3.4 2.0
+tn "fw_version_ge garbage"      fw_version_ge "" 2.0
+t  "agent zone sorts after external and internal" bash -c '[[ "$1" > external && "$1" > internal && "$1" > trusted ]]' _ "$AGENT_ZONE"
 FW_PRIORITY_OK=1; emit_zone agents "Agents" "d" "" a b none none -10
 t "zone priority attr"      grep -q '<zone priority="-10">' "$tmp/firewalld/zones/agents.xml"
 FW_PRIORITY_OK=0; emit_zone agents "Agents" "d" "" a b none none -10
@@ -100,6 +102,18 @@ MODE=blacklist; compute_plan; t "vbf args blacklist" eq "$VBF_ARGS" "--voipbl --
 MODE=whitelist; ADD_RFC1918=1; compute_plan; t "vbf args whitelist rfc1918" eq "$VBF_ARGS" "--white --addrfc1918 --quiet"
 SSH_IP=10.0.0.5; TRUSTED_NETS=(10.0.0.0/8); SSH_WHITELIST=1; WHITELIST=(); CARRIER_IPS=(); compute_plan
 t "ssh in trusted net not whitelisted" eq "${ALLOW_NOW[*]-}" ""
+
+# --- trusted/internal overlap is not whitelisted -----------------------------------------------------
+mkdir -p "$tmp/firewalld/zones"; printf '<zone target="ACCEPT">
+  <source address="135.181.56.155"/>
+  <source address="10.9.0.0/16"/>
+</zone>
+' > "$tmp/firewalld/zones/trusted.xml"
+FW_ETC=$tmp/firewalld; MODE=dynamic; SSH_IP=59.103.120.47; SSH_WHITELIST=1; TRUSTED_NETS=(); TRUSTED_IFACES=(); INTERNAL_NETS=(192.0.2.5/32)
+WHITELIST=(203.81.238.197 10.9.4.4); CARRIER_IPS=(135.181.56.155 143.244.163.152 192.0.2.5); compute_plan
+t "overlap: allow list"   eq "${ALLOW_NOW[*]}" "59.103.120.47 203.81.238.197 143.244.163.152"
+t "overlap: skipped"      eq "${SKIPPED_LAN[*]}" "10.9.4.4 135.181.56.155 192.0.2.5"
+INTERNAL_NETS=()
 
 # --- state file round trip ------------------------------------------------------------------------
 STATE_FILE=$tmp/state; VBF_ARGS="--white --dynamic --quiet"; PORTAL_FQDN="d.example.com"; ORIGINAL_BACKUP_DIR="/var/backups/x y"; BACKUP_DIR=/b
