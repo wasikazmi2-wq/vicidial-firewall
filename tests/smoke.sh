@@ -58,7 +58,7 @@ chk "(dry-run) write $T/srv/www/vhosts/dynportal/inc/defaults.inc.php"
 chk "agents zone ......... http https asterisk rtp  for addresses validated through the portal"
 chk "(dry-run) write $T/etc/fail2ban/jail.d/vicidial-dynportal.conf"
 chk "(dry-run) append 'Listen 446' to $T/etc/apache2/ports.conf"
-chk "vicidial-firewall 1.1.0 installed  -  mode: dynamic"
+chk "vicidial-firewall 1.1.1 installed  -  mode: dynamic"
 if grep -qE 'unbound variable|command not found|syntax error' <<<"$out"; then echo "SMOKE A: shell error in output"; fail=1; fi
 [ $fail -eq 0 ] || printf '%s\n' "$out" | tail -60
 

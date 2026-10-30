@@ -185,7 +185,7 @@ original backup for `uninstall`, and keeps the portal's random form field names.
 
 | Where | What |
 |---|---|
-| `/usr/share/vicibox-firewall/VB-firewall.pl`, `/usr/bin/VB-firewall` | official script + symlink (ViciBox RPM layout); on ViciBox the RPM's copy is used |
+| `/usr/share/vicibox-firewall/VB-firewall.pl`, `/usr/bin/VB-firewall` | official script + symlink (ViciBox RPM layout); an older copy from the vicibox-firewall package (ViciBox 10, 11) is replaced by the current release, the old one kept in the backup |
 | `/etc/firewalld/ipsets/*.xml` | the 8 official IP set definitions |
 | `/etc/firewalld/services/` | `dynportal`, `dynportal-ssl`, `asterisk` (SIP 5060/5061, IAX 4569, 8088/8089), `rtp` (your RTP range), only where the distribution lacks them |
 | `/etc/firewalld/zones/{public,external,agents,internal,drop}.xml` | the ViciBox zone layout with distribution-neutral service names, plus a separate `agents` zone for validated addresses; zone priorities on firewalld 0.9+ |

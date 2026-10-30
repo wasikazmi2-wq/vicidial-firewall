@@ -21,7 +21,7 @@
 set -euo pipefail
 umask 022
 
-VF_VERSION="1.1.0"
+VF_VERSION="1.1.1"
 
 # ------------------------------------------------------------------------------------------------
 # Paths: the official ViciBox layout wherever one exists
@@ -435,12 +435,23 @@ preflight() {
 # ------------------------------------------------------------------------------------------------
 # Packages
 # ------------------------------------------------------------------------------------------------
-pkg_install() {
+pkg_installed() {
 	case $FAMILY in
-		debian) DEBIAN_FRONTEND=noninteractive run apt-get install -y -qq --no-install-recommends "$@" ;;
-		rhel)   run "$PKG" -y -q install "$@" ;;
-		suse)   run zypper -n -q install "$@" ;;
+		debian) dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q 'install ok installed' ;;
+		*)      rpm -q "$1" >/dev/null 2>&1 ;;
 	esac
+}
+pkg_install() { # installs only what is missing, so an end-of-life repository (ViciBox 10 / Leap 15.2) does not break a run
+	local p rc=0 todo=()
+	for p in "$@"; do pkg_installed "$p" || todo+=("$p"); done
+	((${#todo[@]})) || return 0
+	case $FAMILY in
+		debian) DEBIAN_FRONTEND=noninteractive run apt-get install -y -qq --no-install-recommends "${todo[@]}" || rc=$? ;;
+		rhel)   run "$PKG" -y -q install "${todo[@]}" || rc=$? ;;
+		suse)   run zypper -n -q --no-refresh install "${todo[@]}" || rc=$?
+		        [ "$rc" -ge 100 ] && rc=0 ;;   # zypper 100-107 are informational (e.g. 106 = a repository was skipped)
+	esac
+	return "$rc"
 }
 pkg_required() { pkg_install "$@" >/dev/null || die "failed to install required packages: $*"; }
 pkg_optional() { local p; for p in "$@"; do pkg_install "$p" >/dev/null 2>&1 || warn "optional package not installed: $p"; done; }
@@ -622,12 +633,19 @@ disable_conflicting_firewalls() {
 # ------------------------------------------------------------------------------------------------
 install_vbfirewall() {
 	hdr "Installing VB-firewall (official ViciBox firewall script)"
-	if ((VICIBOX)) && rpm -q vicibox-firewall >/dev/null 2>&1 && [ -x "$VBF_DIR/VB-firewall.pl" ]; then
-		ok "vicibox-firewall RPM is installed; its VB-firewall.pl is used"
+	local existing="$VBF_DIR/VB-firewall.pl"
+	if [ -f "$existing" ] && cmp -s "$PAYLOAD_DIR/official/VB-firewall.pl" "$existing"; then
+		ok "$existing is already the vendored official release"
+	elif [ -f "$existing" ] && grep -q 'Sys::Syslog' "$existing"; then
+		ok "keeping the installed $existing (same generation as the vendored copy, from the vicibox-firewall package)"
 	else
+		if [ -f "$existing" ]; then
+			((DRY_RUN)) || cp -a "$existing" "$BACKUP_DIR/VB-firewall.pl.orig" 2>/dev/null || true
+			info "the installed VB-firewall.pl is an older release (no syslog, needs /usr/bin/aggregate); replacing it with the current official one (old copy kept in $BACKUP_DIR)"
+		fi
 		run mkdir -p "$VBF_DIR"
-		install_if_changed "$PAYLOAD_DIR/official/VB-firewall.pl" "$VBF_DIR/VB-firewall.pl" 0755
-		ok "$VBF_DIR/VB-firewall.pl (official copy, see official/SOURCES.md)"
+		install_if_changed "$PAYLOAD_DIR/official/VB-firewall.pl" "$existing" 0755
+		ok "$existing (official copy, see official/SOURCES.md)"
 	fi
 	[ -e "$VBF_BIN" ] || run ln -sf "$VBF_DIR/VB-firewall.pl" "$VBF_BIN"
 	[ -e /usr/local/bin/VB-firewall.pl ] || run ln -sf "$VBF_DIR/VB-firewall.pl" /usr/local/bin/VB-firewall.pl
@@ -638,7 +656,10 @@ install_vbfirewall() {
 # ------------------------------------------------------------------------------------------------
 # firewalld configuration (ViciBox layout, distribution-neutral service names)
 # ------------------------------------------------------------------------------------------------
-distro_service_defined() { [ -f "$FW_LIB/services/$1.xml" ]; }
+service_defined_elsewhere() { # a definition that is not ours: from the distribution or from a ViciBox package
+	[ -f "$FW_LIB/services/$1.xml" ] && return 0
+	[ -f "$FW_ETC/services/$1.xml" ] && ! grep -q 'vicidial-firewall' "$FW_ETC/services/$1.xml"
+}
 
 emit_zone() { # NAME SHORT DESCRIPTION TARGET services_array ipsets_array addresses_array ports_array [PRIORITY]
 	local name=$1 short=$2 desc=$3 target=$4 prio=${9:-} s attrs=""
@@ -661,7 +682,7 @@ emit_zone() { # NAME SHORT DESCRIPTION TARGET services_array ipsets_array addres
 emit_service() { # NAME SHORT DESCRIPTION port/proto...
 	local name=$1 short=$2 desc=$3 p; shift 3
 	{
-		printf '<?xml version="1.0" encoding="utf-8"?>\n<service>\n  <short>%s</short>\n  <description>%s</description>\n' "$short" "$desc"
+		printf '<?xml version="1.0" encoding="utf-8"?>\n<!-- managed by vicidial-firewall -->\n<service>\n  <short>%s</short>\n  <description>%s</description>\n' "$short" "$desc"
 		for p in "$@"; do printf '  <port protocol="%s" port="%s"/>\n' "${p#*/}" "${p%/*}"; done
 		printf '</service>\n'
 	} | write_file "$FW_ETC/services/$name.xml"
@@ -675,9 +696,11 @@ install_firewalld_config() {
 	ok "IP sets: whiteips whitenets dynamiclist blackips blacknets voipblip voipblnet geoblock (official definitions)"
 	emit_service dynportal-ssl "ViciBox Dynamic Portal SSL" "Allows remote agents to authenticate in a portal to access ViciDial" "$PORTAL_PORT/tcp"
 	emit_service dynportal "ViciBox Dynamic Portal" "Allows remote agents to authenticate in a portal to access ViciDial" "$PORTAL_HTTP_PORT/tcp"
-	if ! distro_service_defined asterisk; then install_if_changed "$PAYLOAD_DIR/src/firewalld/services/asterisk.xml" "$FW_ETC/services/asterisk.xml"; fi
-	if ! distro_service_defined rtp || [ -f "$FW_ETC/services/rtp.xml" ]; then
+	if ! service_defined_elsewhere asterisk; then install_if_changed "$PAYLOAD_DIR/src/firewalld/services/asterisk.xml" "$FW_ETC/services/asterisk.xml"; fi
+	if ! service_defined_elsewhere rtp; then
 		emit_service rtp "RTP (ViciDial)" "Asterisk RTP media range from /etc/asterisk/rtp.conf" "$RTP_RANGE/udp"
+	else
+		info "keeping the existing rtp service definition: $(firewall-cmd --info-service=rtp 2>/dev/null | sed -n 's/^[[:space:]]*ports: //p' || true)"
 	fi
 	ok "services: dynportal-ssl($PORTAL_PORT) dynportal($PORTAL_HTTP_PORT) asterisk rtp($RTP_RANGE)"
 
@@ -1030,8 +1053,16 @@ activate_firewall() {
 	hdr "Activating the firewall"
 	run systemctl enable firewalld >/dev/null 2>&1 || true
 	if systemctl is-active --quiet firewalld; then
-		info "reloading firewalld (slow if large block lists are loaded)"
-		run firewall-cmd --reload >/dev/null || die "firewall-cmd --reload failed; check 'journalctl -u firewalld'"
+		local loaded; loaded=$(firewall-cmd --ipset=voipblip --get-entries 2>/dev/null | grep -c . || true)
+		if [ "${loaded:-0}" -gt 5000 ]; then
+			# a reload removes the entries one by one and can take minutes with the voipbl.org list (ViciBox default);
+			# a restart drops the whole rule set at once. The firewall is open for the second or two in between.
+			info "restarting firewalld: $loaded voipbl.org entries are loaded and a reload would take minutes"
+			run systemctl restart firewalld || die "firewalld did not restart; check 'journalctl -u firewalld'"
+		else
+			info "reloading firewalld"
+			run firewall-cmd --reload >/dev/null || die "firewall-cmd --reload failed; check 'journalctl -u firewalld'"
+		fi
 	else
 		run systemctl start firewalld || die "firewalld did not start; check 'journalctl -u firewalld'"
 	fi
