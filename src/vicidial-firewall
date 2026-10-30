@@ -1,0 +1,278 @@
+#!/usr/bin/env bash
+#
+# vicidial-firewall - management helper, installed to /usr/local/sbin by the vicidial-firewall installer.
+# Wraps the official ViciBox pieces (VB-firewall.pl, firewalld IP sets, the Dynamic Portal) for day-to-day use.
+#
+# shellcheck disable=SC2034,SC1090
+set -euo pipefail
+
+CONF_DIR=/etc/vicidial-firewall
+STATE_FILE=$CONF_DIR/state
+ASTGUI_CONF=/etc/astguiclient.conf
+FWC=/usr/bin/firewall-cmd
+SAFETY_UNIT=vicidial-firewall-safety
+ME=${0##*/}
+
+# defaults, overridden by the state file
+MODE=dynamic VBF_ARGS="--white --dynamic --quiet" VBF_BIN=/usr/bin/VB-firewall VBF_DIR=/usr/share/vicibox-firewall
+PORTAL=1 PORTAL_INSTALLED=0 RPM_PORTAL=0 PORTAL_PORT=446 PORTAL_HTTP=0 PORTAL_HTTP_PORT=81 PORTAL_FQDN="" PORTAL_DIR=/srv/www/vhosts/dynportal
+VHOST_FILE="" VHOST_HTTP_FILE="" LISTEN_FILE="" LISTEN_ADDED=0 LISTEN_HTTP_ADDED=0 APACHE_SVC="" FAMILY="" INSTALLED_AT=""
+BACKUP_DIR="" ORIGINAL_BACKUP_DIR="" ORIG_FW_ACTIVE=1 ORIG_FW_ENABLED=1 DYNAMIC_AGE=15 PUBLIC_IFACE="" SSH_IP="" KEEP_SSH_PUBLIC=0
+AGENT_SSH=0 PUBLIC_RTP=1 PORTAL_LOCKOUT=5 FAIL2BAN_INSTALLED=0 F2B_ETC=/etc/fail2ban
+DB_HOST="" DB_USER="" DB_PASS="" DB_NAME="" DB_PORT="" MYSQL_BIN=""
+
+c_red=$'\e[31m' c_grn=$'\e[32m' c_yel=$'\e[33m' c_bld=$'\e[1m' c_off=$'\e[0m'
+[ -t 1 ] || { c_red="" c_grn="" c_yel="" c_bld="" c_off=""; }
+say()  { printf '%s\n' "$*"; }
+ok()   { say "${c_grn}[ok]${c_off} $*"; }
+warn() { say "${c_yel}[warning]${c_off} $*"; }
+die()  { say "${c_red}[error]${c_off} $*" >&2; exit 1; }
+need_root() { [ "$(id -u)" -eq 0 ] || die "run as root"; }
+
+usage() {
+	cat <<EOF
+$ME - manage the ViciDial firewall installed by vicidial-firewall
+
+  $ME status                          zones, IP sets, cron job, portal, safety timer
+  $ME whitelist list                  the ViciWhite IP list (ViciDial Admin > IP Lists)
+  $ME whitelist add IP|CIDR           add an address (applied to the firewall right away)
+  $ME whitelist remove IP|CIDR        remove an address
+  $ME dynamic list                    addresses allowed because of a ViciDial / portal login
+  $ME dynamic remove IP               drop an address from the dynamic set and its portal validations
+  $ME sync                            run VB-firewall now instead of waiting for cron
+  $ME confirm                         cancel the post-install safety rollback
+  $ME rollback                        restore the pre-install firewall configuration and crontab now
+  $ME emergency-open | emergency-close   runtime-only: open ssh/http/https to everyone (and close again)
+  $ME logs [N]                        last N VB-firewall journal lines
+  $ME portal-test                     fetch the portal page locally
+  $ME uninstall [--yes]               remove everything the installer added and restore the backup
+EOF
+}
+
+load_state() {
+	if [ -r "$STATE_FILE" ]; then
+		# shellcheck disable=SC1090
+		. "$STATE_FILE"
+	fi
+}
+read_db_config() {
+	local conf_val
+	conf_val() { sed -n "s/^[[:space:]]*$1[[:space:]]*=>[[:space:]]*//p" "$ASTGUI_CONF" 2>/dev/null | head -1 | sed -e 's/[#;].*$//' -e 's/[[:space:]]*$//'; }
+	if [ -r "$ASTGUI_CONF" ]; then
+		: "${DB_HOST:=$(conf_val VARDB_server)}" "${DB_USER:=$(conf_val VARDB_user)}" "${DB_PASS:=$(conf_val VARDB_pass)}"
+		: "${DB_NAME:=$(conf_val VARDB_database)}" "${DB_PORT:=$(conf_val VARDB_port)}"
+	fi
+	: "${DB_HOST:=localhost}" "${DB_USER:=cron}" "${DB_PASS:=1234}" "${DB_NAME:=asterisk}" "${DB_PORT:=3306}"
+	MYSQL_BIN=$(command -v mysql || command -v mariadb || true)
+	[ -n "$MYSQL_BIN" ] || die "no mysql/mariadb client found"
+}
+db_q() { MYSQL_PWD="$DB_PASS" "$MYSQL_BIN" --batch --raw --skip-column-names --connect-timeout=10 -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" "$DB_NAME" -e "$1"; }
+
+valid_ipv4() {
+	local ip=${1:-} o
+	[[ $ip =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
+	for o in "${BASH_REMATCH[@]:1}"; do (( 10#$o <= 255 )) || return 1; done
+	[ "$ip" != 0.0.0.0 ] && [ "$ip" != 255.255.255.255 ]
+}
+valid_cidr() {
+	local net bits
+	[[ ${1:-} =~ ^([0-9.]+)/([0-9]{1,2})$ ]] || return 1
+	net=${BASH_REMATCH[1]} bits=${BASH_REMATCH[2]}   # copy first: valid_ipv4 overwrites BASH_REMATCH
+	valid_ipv4 "$net" && (( 10#$bits >= 1 && 10#$bits <= 32 ))
+}
+fw_running() { [ -x "$FWC" ] && "$FWC" --state >/dev/null 2>&1; }
+ipset_count() { "$FWC" --ipset="$1" --get-entries 2>/dev/null | grep -c . || true; }
+# shellcheck disable=SC2086
+sync_now() { [ -x "$VBF_BIN" ] || die "$VBF_BIN not found"; "$VBF_BIN" ${VBF_ARGS/--quiet/} --verbose; }
+
+# ------------------------------------------------------------------------------------------------
+cmd_status() {
+	load_state
+	say "${c_bld}vicidial-firewall status${c_off}   (mode: $MODE, installed ${INSTALLED_AT:-?})"
+	if fw_running; then ok "firewalld running; default zone: $("$FWC" --get-default-zone 2>/dev/null)"; else warn "firewalld is NOT running"; fi
+	if fw_running; then
+		say ""; say "${c_bld}Active zones${c_off}"; "$FWC" --get-active-zones 2>/dev/null | sed 's/^/  /'
+		say ""; say "${c_bld}Public zone allows${c_off}: $("$FWC" --zone=public --list-services 2>/dev/null) $("$FWC" --zone=public --list-ports 2>/dev/null)"
+		say "${c_bld}External zone (ViciWhite) allows${c_off}: $("$FWC" --zone=external --list-services 2>/dev/null)"
+		say "${c_bld}Agents zone (validated) allows${c_off}: $("$FWC" --zone=agents --list-services 2>/dev/null)"
+		say ""; say "${c_bld}IP sets${c_off}"
+		local s
+		for s in whiteips whitenets dynamiclist blackips blacknets voipblip voipblnet geoblock; do printf '  %-12s %s\n' "$s" "$(ipset_count "$s")"; done
+	fi
+	say ""; say "${c_bld}Cron${c_off}"
+	crontab -l 2>/dev/null | grep -E 'VB-firewall' | sed 's/^/  /' || say "  (no VB-firewall cron job!)"
+	say ""; say "${c_bld}Last VB-firewall runs${c_off} (journalctl -t VB-firewall)"
+	journalctl -t VB-firewall -n 5 --no-pager -o short 2>/dev/null | sed 's/^/  /' || true
+	if [ "$PORTAL" = 1 ]; then
+		say ""; say "${c_bld}Dynamic Portal${c_off}: https://$PORTAL_FQDN:$PORTAL_PORT/valid8.php"
+		if curl -ks --max-time 10 "https://127.0.0.1:$PORTAL_PORT/valid8.php" 2>/dev/null | grep -q 'User Validation'; then ok "portal answers locally"; else warn "portal does not answer on 127.0.0.1:$PORTAL_PORT"; fi
+		if command -v fail2ban-client >/dev/null 2>&1; then
+			say "${c_bld}fail2ban${c_off}: $(fail2ban-client status vicidial-dynportal 2>/dev/null | grep -E 'Currently banned|Total banned' | sed 's/^[[:space:]|`-]*//' | paste -sd ';' - 2>/dev/null || echo 'jail vicidial-dynportal not active')"
+		fi
+		say "${c_bld}Last portal logins${c_off} (journalctl -t dynportal)"
+		journalctl -t dynportal -n 5 --no-pager -o short 2>/dev/null | sed 's/^/  /' || true
+	fi
+	if systemctl is-active --quiet "$SAFETY_UNIT.timer" 2>/dev/null; then
+		say ""; warn "safety timer is armed: run '$ME confirm' or the previous firewall comes back ($(systemctl show "$SAFETY_UNIT.timer" -p NextElapseUSecRealtime --value 2>/dev/null))"
+	fi
+}
+
+cmd_whitelist() {
+	load_state; read_db_config
+	local sub=${1:-list} ip=${2:-}
+	case $sub in
+		list)
+			say "${c_bld}ViciWhite (ViciDial Admin > IP Lists)${c_off}"
+			db_q "SELECT ip_address FROM vicidial_ip_list_entries WHERE ip_list_id='ViciWhite' ORDER BY INET_ATON(SUBSTRING_INDEX(ip_address,'/',1))" | sed 's/^/  /'
+			if fw_running; then say ""; say "${c_bld}In the firewall now${c_off}: whiteips $(ipset_count whiteips), whitenets $(ipset_count whitenets)"; fi ;;
+		add)
+			need_root; valid_ipv4 "$ip" || valid_cidr "$ip" || die "usage: $ME whitelist add IP|CIDR"
+			db_q "INSERT INTO vicidial_ip_list_entries (ip_address, ip_list_id) SELECT '$ip','ViciWhite' FROM DUAL WHERE NOT EXISTS (SELECT 1 FROM vicidial_ip_list_entries WHERE ip_list_id='ViciWhite' AND ip_address='$ip')"
+			ok "$ip is in ViciWhite"
+			if fw_running && [ "$MODE" != blacklist ]; then
+				if valid_cidr "$ip"; then "$FWC" --ipset=whitenets --add-entry="$ip" >/dev/null 2>&1 || true; else "$FWC" --ipset=whiteips --add-entry="$ip" >/dev/null 2>&1 || true; fi
+				sync_now >/dev/null 2>&1 || true
+				ok "firewall updated"
+			fi ;;
+		remove|del|rm)
+			need_root; valid_ipv4 "$ip" || valid_cidr "$ip" || die "usage: $ME whitelist remove IP|CIDR"
+			db_q "DELETE FROM vicidial_ip_list_entries WHERE ip_list_id='ViciWhite' AND ip_address='$ip'"
+			ok "$ip removed from ViciWhite"
+			if fw_running && [ "$MODE" != blacklist ]; then sync_now >/dev/null 2>&1 || true; ok "firewall updated"; fi ;;
+		*) die "usage: $ME whitelist list|add IP|remove IP" ;;
+	esac
+}
+
+cmd_dynamic() {
+	load_state; read_db_config
+	local sub=${1:-list} ip=${2:-}
+	case $sub in
+		list)
+			say "${c_bld}Addresses with a ViciDial or portal login in the last $DYNAMIC_AGE days${c_off}"
+			db_q "SELECT computer_ip, MAX(event_date), GROUP_CONCAT(DISTINCT user ORDER BY user SEPARATOR ',') FROM vicidial_user_log WHERE event IN ('LOGIN','VICIBOX') AND event_date >= DATE_SUB(NOW(), INTERVAL $DYNAMIC_AGE DAY) GROUP BY computer_ip ORDER BY 2 DESC" \
+				| awk -F'\t' '{printf "  %-16s last %s  %s\n", $1, $2, $3}'
+			if fw_running; then say ""; say "${c_bld}dynamiclist entries in the firewall${c_off}: $(ipset_count dynamiclist)"; fi ;;
+		remove|del|rm)
+			need_root; valid_ipv4 "$ip" || die "usage: $ME dynamic remove IP"
+			if fw_running; then "$FWC" --ipset=dynamiclist --remove-entry="$ip" >/dev/null 2>&1 || true; fi
+			db_q "DELETE FROM vicidial_user_log WHERE event='VICIBOX' AND computer_ip='$ip'"
+			ok "$ip removed from the dynamic set and its portal validations deleted"
+			warn "a normal ViciDial LOGIN from that address within $DYNAMIC_AGE days still re-allows it; use ViciBlack or change the agent's password to lock it out" ;;
+		*) die "usage: $ME dynamic list|remove IP" ;;
+	esac
+}
+
+cmd_confirm() {
+	need_root; load_state
+	mkdir -p "$CONF_DIR"; date -Is >"$CONF_DIR/confirmed"
+	systemctl stop "$SAFETY_UNIT.timer" >/dev/null 2>&1 || true
+	systemctl reset-failed "$SAFETY_UNIT.service" >/dev/null 2>&1 || true
+	ok "confirmed: the safety rollback is cancelled; the firewall configuration stays"
+}
+
+do_rollback() { # restore /etc/firewalld + root crontab from the ORIGINAL pre-install backup
+	load_state
+	local b=${ORIGINAL_BACKUP_DIR:-$BACKUP_DIR}
+	[ -n "$b" ] && [ -d "$b" ] || die "no backup directory recorded in $STATE_FILE"
+	say "restoring the pre-install firewall configuration from $b"
+	systemctl stop "$SAFETY_UNIT.timer" >/dev/null 2>&1 || true
+	crontab -l 2>/dev/null | { grep -v -E '(^|[[:space:]/])VB-firewall(\.pl)?([[:space:]]|$)' || true; } | { grep -v '^### ViciBox integrated firewall' || true; } | crontab - 2>/dev/null || true
+	if [ -f "$b/root-crontab.txt" ]; then crontab "$b/root-crontab.txt"; elif [ -f "$b/root-crontab.NONE" ]; then crontab -r 2>/dev/null || true; fi
+	rm -rf /etc/firewalld.vicidial-firewall-rollback
+	if [ -d /etc/firewalld ]; then mv /etc/firewalld /etc/firewalld.vicidial-firewall-rollback; fi
+	mkdir -p /etc/firewalld
+	if [ -f "$b/firewalld-etc.tgz" ]; then tar -xzf "$b/firewalld-etc.tgz" -C /; fi
+	if [ "${ORIG_FW_ACTIVE:-1}" = 1 ]; then
+		"$FWC" --reload >/dev/null 2>&1 || systemctl restart firewalld >/dev/null 2>&1 || true
+		ok "firewalld reloaded with the previous configuration"
+	else
+		systemctl stop firewalld >/dev/null 2>&1 || true
+		if [ "${ORIG_FW_ENABLED:-1}" != 1 ]; then systemctl disable firewalld >/dev/null 2>&1 || true; fi
+		if [ -f "$b/iptables-save.txt" ] && command -v iptables-restore >/dev/null 2>&1; then iptables-restore <"$b/iptables-save.txt" 2>/dev/null || true; fi
+		ok "firewalld stopped (it was not running before the installation); previous iptables rules restored where possible"
+	fi
+	rm -rf /etc/firewalld.vicidial-firewall-rollback
+	date -Is >"$CONF_DIR/ROLLED_BACK"
+	logger -t vicidial-firewall "rolled back to the pre-install firewall configuration ($b)" || true
+}
+
+cmd_rollback() { need_root; do_rollback; say "The Dynamic Portal files and VB-firewall stay installed; re-run the installer to try again, or '$ME uninstall' to remove them."; }
+
+cmd_rollback_if_unconfirmed() {
+	need_root; load_state
+	if [ -f "$CONF_DIR/confirmed" ]; then logger -t vicidial-firewall "safety timer: installation was confirmed, nothing to do" || true; exit 0; fi
+	logger -t vicidial-firewall "safety timer expired without '$ME confirm': rolling back" || true
+	do_rollback
+	wall "vicidial-firewall: the new firewall was NOT confirmed within the safety window and has been rolled back. See $CONF_DIR/ROLLED_BACK" 2>/dev/null || true
+}
+
+cmd_emergency_open() {
+	need_root; fw_running || die "firewalld is not running"
+	local s; for s in ssh http https; do "$FWC" --zone=public --add-service="$s" >/dev/null 2>&1 || true; done
+	warn "ssh, http and https are now open to EVERYONE in the public zone (runtime only: gone after 'firewall-cmd --reload' or a reboot)"
+	say "close again with: $ME emergency-close"
+}
+cmd_emergency_close() {
+	need_root; fw_running || die "firewalld is not running"
+	load_state
+	local s; for s in ssh http https; do
+		if [ "$s" = ssh ] && [ "${KEEP_SSH_PUBLIC:-0}" = 1 ]; then continue; fi
+		[ "$MODE" = blacklist ] && continue
+		"$FWC" --zone=public --remove-service="$s" >/dev/null 2>&1 || true
+	done
+	ok "public zone back to: $("$FWC" --zone=public --list-services)"
+}
+
+cmd_logs() { journalctl -t VB-firewall -n "${1:-50}" --no-pager 2>/dev/null || die "journalctl not available"; }
+cmd_portal_test() {
+	load_state
+	local body; body=$(curl -ksi --max-time 15 "https://127.0.0.1:$PORTAL_PORT/valid8.php" 2>&1 || true)
+	printf '%s\n' "$body" | head -1
+	if grep -q 'User Validation' <<<"$body"; then ok "portal page renders"; else warn "portal page did not render; check the error log of the web server"; fi
+	grep -o 'connect ERROR[^<]*' <<<"$body" | head -1 || true
+}
+
+cmd_uninstall() {
+	need_root; load_state
+	if [ "${1:-}" != --yes ]; then
+		local ans=""; read -r -p "Remove vicidial-firewall, restore the pre-install firewall and crontab, and delete the portal? [y/N] " ans </dev/tty || true
+		[[ $ans =~ ^[Yy] ]] || die "aborted"
+	fi
+	do_rollback
+	# portal
+	if [ -n "$VHOST_FILE" ] && [ -f "$VHOST_FILE" ] && grep -q vicidial-firewall "$VHOST_FILE"; then rm -f "$VHOST_FILE"; fi
+	if [ -n "$VHOST_HTTP_FILE" ] && [ -f "$VHOST_HTTP_FILE" ] && grep -q vicidial-firewall "$VHOST_HTTP_FILE"; then rm -f "$VHOST_HTTP_FILE"; fi
+	if [ "$FAMILY" = debian ]; then a2dissite -q dynportal-ssl dynportal >/dev/null 2>&1 || true; fi
+	if [ -n "$LISTEN_FILE" ] && [ -f "$LISTEN_FILE" ]; then sed -i '/^# vicidial-firewall: ViciBox Dynamic Portal$/,+1d' "$LISTEN_FILE"; fi
+	if [ "$RPM_PORTAL" != 1 ] && [ -d "$PORTAL_DIR" ]; then rm -rf "$PORTAL_DIR"; fi
+	if [ -n "$APACHE_SVC" ]; then systemctl reload "$APACHE_SVC" >/dev/null 2>&1 || true; fi
+	# fail2ban jail
+	rm -f "$F2B_ETC/jail.d/vicidial-dynportal.conf" "$F2B_ETC/filter.d/vicidial-dynportal.conf"
+	if command -v fail2ban-client >/dev/null 2>&1; then fail2ban-client reload >/dev/null 2>&1 || true; fi
+	# VB-firewall (only our copy, never an RPM's)
+	if ! rpm -q vicibox-firewall >/dev/null 2>&1; then
+		[ -L "$VBF_BIN" ] && rm -f "$VBF_BIN"
+		[ -L /usr/local/bin/VB-firewall.pl ] && rm -f /usr/local/bin/VB-firewall.pl
+		rm -rf "$VBF_DIR"
+	fi
+	rm -rf "$CONF_DIR"
+	rm -f /usr/local/sbin/vicidial-firewall
+	ok "vicidial-firewall removed. Backups stay in /var/backups/vicidial-firewall. Packages (firewalld, ipset, ...) were left installed."
+}
+
+case ${1:-help} in
+	status) cmd_status ;;
+	whitelist) shift; cmd_whitelist "$@" ;;
+	dynamic) shift; cmd_dynamic "$@" ;;
+	sync) need_root; load_state; sync_now ;;
+	confirm) cmd_confirm ;;
+	rollback) cmd_rollback ;;
+	rollback-if-unconfirmed) cmd_rollback_if_unconfirmed ;;
+	emergency-open) cmd_emergency_open ;;
+	emergency-close) cmd_emergency_close ;;
+	logs) shift; cmd_logs "$@" ;;
+	portal-test) cmd_portal_test ;;
+	uninstall) shift; cmd_uninstall "$@" ;;
+	-h|--help|help) usage ;;
+	*) usage; exit 1 ;;
+esac

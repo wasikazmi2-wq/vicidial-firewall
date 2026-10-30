@@ -1,0 +1,17 @@
+#!/bin/bash
+
+#
+# Downloads and installs the dynamic portal for ViciBox Firewall
+#
+
+mkdir -p /srv/www/vhosts
+cd /srv/www/vhosts/
+wget http://download.vicidial.com/vicibox/dynportal-current.tar.xz -O dynportal-current.tar.xz
+tar -xf dynportal-current.tar.xz
+cd dynportal
+mv ./apache/*.conf /etc/apache2/vhosts.d/
+rm -rf ./apache
+echo "Listen 81" >> /etc/apache2/listen.conf
+echo "Listen 446" >> /etc/apache2/listen.conf
+SuSEfirewall2 open EXT TCP 81
+SuSEfirewall2 open EXT TCP 443

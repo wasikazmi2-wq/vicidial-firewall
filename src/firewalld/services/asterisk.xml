@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- vicidial-firewall: installed only when the distribution does not already define an "asterisk" service
+     (openSUSE/ViciBox does). Same role as the ViciBox "asterisk" service: SIP, IAX2 and the Asterisk
+     HTTP/WebSocket server used by WebRTC phones. Nothing here is reachable from the public zone. -->
+<service>
+  <short>Asterisk (ViciDial)</short>
+  <description>SIP signalling (5060 UDP/TCP, 5061 TLS), IAX2 (4569 UDP) and the Asterisk built-in HTTP/WebSocket server (8088/8089 TCP) used by WebRTC agent phones.</description>
+  <port protocol="udp" port="5060"/>
+  <port protocol="tcp" port="5060"/>
+  <port protocol="tcp" port="5061"/>
+  <port protocol="udp" port="4569"/>
+  <port protocol="tcp" port="8088"/>
+  <port protocol="tcp" port="8089"/>
+</service>
