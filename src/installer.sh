@@ -21,7 +21,7 @@
 set -euo pipefail
 umask 022
 
-VF_VERSION="1.1.1"
+VF_VERSION="1.1.2"
 
 # ------------------------------------------------------------------------------------------------
 # Paths: the official ViciBox layout wherever one exists
@@ -441,20 +441,22 @@ pkg_installed() {
 		*)      rpm -q "$1" >/dev/null 2>&1 ;;
 	esac
 }
-pkg_install() { # installs only what is missing, so an end-of-life repository (ViciBox 10 / Leap 15.2) does not break a run
-	local p rc=0 todo=()
+pkg_install() { # installs only what is missing (so an end-of-life repository, e.g. ViciBox 10, does not break a run) and never hangs
+	local p rc=0 todo=() t=${PKG_TIMEOUT:-600}
 	for p in "$@"; do pkg_installed "$p" || todo+=("$p"); done
 	((${#todo[@]})) || return 0
 	case $FAMILY in
-		debian) DEBIAN_FRONTEND=noninteractive run apt-get install -y -qq --no-install-recommends "${todo[@]}" || rc=$? ;;
-		rhel)   run "$PKG" -y -q install "${todo[@]}" || rc=$? ;;
-		suse)   run zypper -n -q --no-refresh install "${todo[@]}" || rc=$?
-		        [ "$rc" -ge 100 ] && rc=0 ;;   # zypper 100-107 are informational (e.g. 106 = a repository was skipped)
+		debian) DEBIAN_FRONTEND=noninteractive run timeout -k 10 "$t" apt-get install -y -qq --no-install-recommends "${todo[@]}" || rc=$? ;;
+		rhel)   run timeout -k 10 "$t" "$PKG" -y -q install "${todo[@]}" || rc=$? ;;
+		suse)   ZYPP_LOCK_TIMEOUT=60 run timeout -k 10 "$t" zypper -n -q --no-refresh install "${todo[@]}" || rc=$?
+		        if [ "$rc" -ge 100 ] && [ "$rc" -le 107 ]; then rc=0; fi ;;   # zypper 100-107 are informational (106 = a repository was skipped)
 	esac
+	if [ "$rc" -eq 124 ]; then logonly "package installation of ${todo[*]} timed out after ${t}s"; fi
 	return "$rc"
 }
-pkg_required() { pkg_install "$@" >/dev/null || die "failed to install required packages: $*"; }
-pkg_optional() { local p; for p in "$@"; do pkg_install "$p" >/dev/null 2>&1 || warn "optional package not installed: $p"; done; }
+pkg_required() { PKG_TIMEOUT=900 pkg_install "$@" >/dev/null || die "failed to install required packages: $* (repository unreachable or packages missing)"; }
+pkg_optional() { local p; for p in "$@"; do PKG_TIMEOUT=120 pkg_install "$p" >/dev/null 2>&1 || warn "optional package not installed: $p (skipped after at most 120 s)"; done; }
+php_has_mysqli() { php -m 2>/dev/null | grep -qi "^mysqli$"; }
 
 install_packages() {
 	hdr "Installing packages"
@@ -462,16 +464,19 @@ install_packages() {
 		debian)
 			DEBIAN_FRONTEND=noninteractive run apt-get update -qq >/dev/null || warn "apt-get update failed; using the cached package lists"
 			pkg_required firewalld ipset curl openssl ca-certificates perl libdbi-perl libdbd-mysql-perl
-			pkg_optional libcrypt-eksblowfish-perl php-mysql
+			pkg_optional libcrypt-eksblowfish-perl
+			php_has_mysqli || pkg_optional php-mysql
 			pkg_install mariadb-client >/dev/null 2>&1 || pkg_install default-mysql-client >/dev/null 2>&1 || pkg_optional mysql-client ;;
 		rhel)
 			[ -n "$PKG" ] || die "neither dnf nor yum found"
 			pkg_required firewalld ipset curl openssl perl perl-DBI perl-DBD-MySQL perl-Sys-Syslog
-			pkg_optional mariadb php-mysqlnd mod_ssl policycoreutils-python-utils perl-Crypt-Eksblowfish ;;
+			pkg_optional mariadb mod_ssl policycoreutils-python-utils perl-Crypt-Eksblowfish
+			php_has_mysqli || pkg_optional php-mysqlnd ;;
 		suse)
 			if ((VICIBOX)); then pkg_optional vicibox-firewall vicibox-dynportal; fi
 			pkg_required firewalld ipset curl openssl perl perl-DBD-mysql
-			pkg_optional mariadb-client perl-Crypt-Eksblowfish php8-mysql ;;
+			pkg_optional mariadb-client perl-Crypt-Eksblowfish
+			php_has_mysqli || pkg_optional php8-mysql php7-mysql ;;
 	esac
 	((DRY_RUN)) && return 0
 	perl -MDBI -MDBD::mysql -MSys::Syslog -e1 2>/dev/null || die "Perl modules DBI, DBD::mysql and Sys::Syslog are required by VB-firewall.pl and are missing"
